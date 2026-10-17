@@ -1,0 +1,300 @@
+--- a/src/core/module.cpp
++++ b/src/core/module.cpp
+@@ -11,11 +11,13 @@
+ #include "common/string_util.h"
+ #include "core/aerolib/aerolib.h"
+ #include "core/cpu_patches.h"
++#include "core/emulator_settings.h"
+ #include "core/libraries/error_codes.h"
+ #include "core/loader/dwarf.h"
+ #include "core/memory.h"
+ #include "core/module.h"
+ #include "core/tls.h"
++#include "driveclub/widescreen.h"
+ 
+ namespace Core {
+ 
+@@ -287,6 +289,10 @@
+             MemoryPatcher::g_eboot_address = base_virtual_addr;
+             MemoryPatcher::g_eboot_image_size = base_size;
+             MemoryPatcher::g_eboot_name = name;
++            // driveclub-pc: widescreen for launcher resolutions wider than 16:9. Applied before the
++            // patch XMLs so that those can still override it.
++            DriveclubPC::Widescreen::Apply(base_virtual_addr, EmulatorSettings.GetWindowWidth(),
++                                           EmulatorSettings.GetWindowHeight());
+             MemoryPatcher::OnGameLoaded();
+         }
+     }
+--- a/src/driveclub/launcher.cpp
++++ b/src/driveclub/launcher.cpp
+@@ -430,8 +430,9 @@
+     y += Row;
+ 
+     const auto [dw, dh] = DisplaySize();
+-    ui.resolutions = {{0, 0}, {3840, 2160}, {2560, 1600}, {2560, 1440}, {1920, 1200},
+-                      {1920, 1080}, {1600, 900}, {1280, 720}};
++    ui.resolutions = {{0, 0},       {3840, 2160}, {3440, 1440}, {2560, 1600},
++                      {2560, 1440}, {2560, 1080}, {2376, 1080}, {1920, 1200},
++                      {1920, 1080}, {1600, 900},  {1280, 720}};
+     std::vector<std::wstring> res_items;
+     int res_sel = 0;
+     for (size_t i = 0; i < ui.resolutions.size(); ++i) {
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1353,6 +1353,8 @@
+     src/driveclub/launcher.h
+     src/driveclub/frame_rate.cpp
+     src/driveclub/frame_rate.h
++    src/driveclub/widescreen.cpp
++    src/driveclub/widescreen.h
+     src/driveclub/deferred_recording.cpp
+     src/driveclub/deferred_recording.h
+     src/driveclub/vk_call_stats.cpp
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -20,6 +20,7 @@
+     shadps4_ngs2_test
+     shadps4_gcn_test
+     shadps4_range_set_test
++    shadps4_driveclub_widescreen_test
+ )
+ 
+ set(SETTINGS_TEST_SOURCES
+@@ -174,6 +175,7 @@
+ add_executable(shadps4_ngs2_test ${NGS2_TEST_SOURCES})
+ add_executable(shadps4_gcn_test ${GCN_TEST_SOURCES})
+ add_executable(shadps4_range_set_test test_range_set.cpp)
++add_executable(shadps4_driveclub_widescreen_test test_driveclub_widescreen.cpp)
+ 
+ foreach(t ${TEST_TARGETS})
+     target_include_directories(${t} PRIVATE
+@@ -219,6 +221,9 @@
+     GTest::gtest_main
+     Boost::headers
+ )
++target_link_libraries(shadps4_driveclub_widescreen_test PRIVATE
++    GTest::gtest_main
++)
+ 
+ if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR
+     CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
+--- /dev/null
++++ b/src/driveclub/widescreen.h
+@@ -0,0 +1,83 @@
++// SPDX-FileCopyrightText: Copyright 2026 Driveclub-PC contributors
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++// driveclub-pc: automatic widescreen.
++//
++// Driveclub renders for a fixed 1920x1080 (16:9) video-out. When the resolution chosen in the
++// launcher (the window size the emulator is started with) is wider than 16:9, three values in
++// the game's eboot are rewritten right after it is loaded, before the patch XMLs are applied:
++//
++//   aspect ratio   float  16/9 -> out_width / 1080       (camera / projection aspect)
++//   output width   u32    1920 -> out_width               (video-out width; height stays 1080)
++//   FOV factor     float  0.5  -> out_width / 3840        (0.5 * aspect / (16/9), i.e. Hor+)
++//
++// The internal render resolution is deliberately left alone: the "internal" resolution patches
++// need extra DMem and have a known depth-rendering bug, the output-only change has neither.
++//
++// The maths lives in this header (no dependencies besides types.h) so it can be unit tested.
++
++#pragma once
++
++#include "common/types.h"
++
++namespace DriveclubPC::Widescreen {
++
++/// Native video-out size of the game.
++inline constexpr u32 kBaseWidth = 1920;
++inline constexpr u32 kBaseHeight = 1080;
++
++/// Largest video-out width that is applied (2560x1440 worth of pixels at a height of 1080).
++/// Wider windows (e.g. 32:9) are clamped to this and end up with bars at the sides.
++inline constexpr u32 kMaxWidth = 3412;
++
++/// Sanity limit for the launcher / display size that is accepted.
++inline constexpr s32 kMaxWindowDimension = 16384;
++
++/// aspect = out_width / kBaseHeight and fov = out_width / kFovDivisor, where
++/// kFovDivisor = kBaseHeight * (16/9) / 0.5 = 3840, so fov = 0.5 * aspect / (16/9).
++inline constexpr float kFovDivisor = 3840.0f;
++
++struct Params {
++    u32 out_width;
++    float aspect;
++    float fov;
++};
++
++/// Computes the patch values for a window of `width` x `height` pixels.
++/// Returns false when nothing should be changed (not wider than 16:9, or invalid).
++/// All of this is integer arithmetic except the last two divisions, and it is mirrored 1:1 by the
++/// machine-code hook in the binary-patched Driveclub-PC.exe.
++[[nodiscard]] inline bool Compute(s32 width, s32 height, Params& out) {
++    if (width <= 0 || height <= 0 || width > kMaxWindowDimension || height > kMaxWindowDimension) {
++        return false;
++    }
++    // Strictly wider than 16:9: width / height > 16 / 9.
++    if (static_cast<s64>(width) * 9 <= static_cast<s64>(height) * 16) {
++        return false;
++    }
++    // out_width = round(kBaseHeight * width / height), forced even, clamped.
++    u32 out_width = static_cast<u32>(
++        (static_cast<u64>(kBaseHeight) * static_cast<u64>(width) + static_cast<u64>(height) / 2) /
++        static_cast<u64>(height));
++    out_width &= ~1u;
++    if (out_width > kMaxWidth) {
++        out_width = kMaxWidth;
++    }
++    if (out_width <= kBaseWidth) {
++        return false;
++    }
++    out.out_width = out_width;
++    out.aspect = static_cast<float>(out_width) / static_cast<float>(kBaseHeight);
++    out.fov = static_cast<float>(out_width) / kFovDivisor;
++    return true;
++}
++
++/// Applies the widescreen patch to the freshly loaded game executable.
++/// `eboot_base` is the guest address the executable was loaded to (module base_virtual_addr),
++/// `width`/`height` the launcher resolution (EmulatorSettings window size).
++/// Does nothing if the window is not widescreen or the executable is not the expected
++/// Driveclub 1.28 one (every location is checked for its original value first).
++/// Returns true if the patch was applied.
++bool Apply(VAddr eboot_base, s32 width, s32 height);
++
++} // namespace DriveclubPC::Widescreen
+--- /dev/null
++++ b/src/driveclub/widescreen.cpp
+@@ -0,0 +1,55 @@
++// SPDX-FileCopyrightText: Copyright 2026 Driveclub-PC contributors
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include <bit>
++#include <cstring>
++
++#include "common/logging/log.h"
++#include "driveclub/widescreen.h"
++
++namespace DriveclubPC::Widescreen {
++
++namespace {
++
++// Offsets from the executable's load address (= the patch XML address minus 0x400000).
++// Driveclub CUSA00093, APP_VER 01.28.
++constexpr VAddr kAspectOffset = 0x729978; // float, camera aspect ratio (16/9)
++constexpr VAddr kWidthOffset = 0x754c1b;  // u32 immediate, video-out width (1920)
++constexpr VAddr kFovOffset = 0x12efac4;   // float, FOV factor (0.5)
++
++constexpr u32 kOriginalAspect = std::bit_cast<u32>(16.0f / 9.0f); // 0x3FE38E39
++constexpr u32 kOriginalFov = std::bit_cast<u32>(0.5f);            // 0x3F000000
++
++u32 Read32(VAddr addr) {
++    u32 value;
++    std::memcpy(&value, reinterpret_cast<const void*>(addr), sizeof(value));
++    return value;
++}
++
++void Write32(VAddr addr, u32 value) {
++    std::memcpy(reinterpret_cast<void*>(addr), &value, sizeof(value));
++}
++
++} // namespace
++
++bool Apply(VAddr eboot_base, s32 width, s32 height) {
++    Params params{};
++    if (eboot_base == 0 || !Compute(width, height, params)) {
++        return false;
++    }
++    if (Read32(eboot_base + kAspectOffset) != kOriginalAspect ||
++        Read32(eboot_base + kWidthOffset) != kBaseWidth ||
++        Read32(eboot_base + kFovOffset) != kOriginalFov) {
++        LOG_WARNING(Loader,
++                    "Driveclub-PC widescreen: unexpected executable contents, patch skipped");
++        return false;
++    }
++    Write32(eboot_base + kAspectOffset, std::bit_cast<u32>(params.aspect));
++    Write32(eboot_base + kWidthOffset, params.out_width);
++    Write32(eboot_base + kFovOffset, std::bit_cast<u32>(params.fov));
++    LOG_INFO(Loader, "Driveclub-PC widescreen: {}x{} -> video-out {}x{}, aspect {:.4f}, fov {:.5f}",
++             width, height, params.out_width, kBaseHeight, params.aspect, params.fov);
++    return true;
++}
++
++} // namespace DriveclubPC::Widescreen
+--- /dev/null
++++ b/tests/test_driveclub_widescreen.cpp
+@@ -0,0 +1,73 @@
++// SPDX-FileCopyrightText: Copyright 2026 Driveclub-PC contributors
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include <bit>
++#include <gtest/gtest.h>
++
++#include "driveclub/widescreen.h"
++
++namespace {
++
++using namespace DriveclubPC::Widescreen;
++
++TEST(DriveclubWidescreen, NotWiderThan16x9IsIgnored) {
++    Params p{};
++    EXPECT_FALSE(Compute(1920, 1080, p));
++    EXPECT_FALSE(Compute(2560, 1440, p));
++    EXPECT_FALSE(Compute(3840, 2160, p));
++    EXPECT_FALSE(Compute(1920, 1200, p)); // 16:10
++    EXPECT_FALSE(Compute(1280, 1024, p));
++}
++
++TEST(DriveclubWidescreen, InvalidSizesAreIgnored) {
++    Params p{};
++    EXPECT_FALSE(Compute(0, 0, p));
++    EXPECT_FALSE(Compute(2376, 0, p));
++    EXPECT_FALSE(Compute(-2376, 1080, p));
++    EXPECT_FALSE(Compute(100000, 1080, p));
++}
++
++TEST(DriveclubWidescreen, Ratio2_2) {
++    Params p{};
++    ASSERT_TRUE(Compute(2376, 1080, p));
++    EXPECT_EQ(p.out_width, 2376u);
++    EXPECT_EQ(std::bit_cast<u32>(p.aspect), 0x400CCCCDu); // 2.2f
++    EXPECT_EQ(std::bit_cast<u32>(p.fov), 0x3F1E6666u);    // 0.61875f
++}
++
++TEST(DriveclubWidescreen, Ultrawide21x9) {
++    Params p{};
++    ASSERT_TRUE(Compute(2560, 1080, p));
++    EXPECT_EQ(p.out_width, 2560u);
++    ASSERT_TRUE(Compute(3440, 1440, p));
++    EXPECT_EQ(p.out_width, 2580u); // 1080 * 3440 / 1440
++    EXPECT_FLOAT_EQ(p.aspect, 2580.0f / 1080.0f);
++}
++
++TEST(DriveclubWidescreen, FovFollowsAspect) {
++    // fov = 0.5 * aspect / (16/9)
++    Params p{};
++    for (s32 w : {2000, 2376, 2560, 3000, 3412}) {
++        ASSERT_TRUE(Compute(w, 1080, p));
++        EXPECT_NEAR(p.fov, 0.5f * p.aspect / (16.0f / 9.0f), 1e-5f);
++    }
++}
++
++TEST(DriveclubWidescreen, SuperUltrawideIsClamped) {
++    Params p{};
++    ASSERT_TRUE(Compute(5120, 1440, p)); // 32:9
++    EXPECT_EQ(p.out_width, kMaxWidth);
++    ASSERT_TRUE(Compute(7680, 1080, p));
++    EXPECT_EQ(p.out_width, kMaxWidth);
++}
++
++TEST(DriveclubWidescreen, OutputWidthIsEven) {
++    Params p{};
++    for (s32 w = 1921; w < 3500; ++w) {
++        if (Compute(w, 1080, p)) {
++            EXPECT_EQ(p.out_width % 2, 0u);
++        }
++    }
++}
++
++} // namespace
